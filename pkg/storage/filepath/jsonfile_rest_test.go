@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io/ioutil"
+	"math/rand/v2"
 	"strings"
 	"sync"
 	"testing"
@@ -407,6 +408,127 @@ func TestFilepathREST_ParallelCreateAndWatch(t *testing.T) {
 		return false, nil
 	})
 	require.NoError(t, waitErr, "Did not receive expected number of Added events (received %d, expected %d)", count, TotalObjects)
+}
+
+func TestFilepathREST_CanRestartWatcherWithoutDrainingResults(t *testing.T) {
+	f := newRESTFixture(t)
+	defer f.tearDown()
+
+	const updaterCount = 5
+	const manifestNamePrefix = "restart-watcher"
+
+	// Create initial manifests objects to be updated by updaters (one per updater)
+	for i := range updaterCount {
+		_, createErr := f.creater().Create(f.rootCtx, &v1alpha1.Manifest{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: fmt.Sprintf("%s-%d", manifestNamePrefix, i),
+			},
+			Spec: v1alpha1.ManifestSpec{
+				Message: "0",
+			},
+		}, nil, nil)
+		require.NoError(t, createErr)
+	}
+
+	updaterCtx, updaterCtxCancel := context.WithCancel(f.rootCtx)
+	defer updaterCtxCancel()
+
+	// Updater changes the Manifest message randomly until cancelled.
+	updater := func(id int) {
+		testManifestName := fmt.Sprintf("%s-%d", manifestNamePrefix, id)
+
+		for updaterCtx.Err() == nil {
+			_, err := f.update(testManifestName, func(obj runtime.Object) {
+				m := obj.(*v1alpha1.Manifest)
+				m.Spec.Message = fmt.Sprintf("%d", rand.Int32())
+			})
+			if err != nil && updaterCtx.Err() == nil {
+				t.Errorf("Unexpected error during update: %v", err)
+			}
+		}
+	}
+
+	for i := range updaterCount {
+		go updater(i)
+	}
+	t.Log("Updaters started")
+
+	watcherDone := make(chan struct{})
+	const watcherRestartInterval = 500 * time.Millisecond
+	const watcherRestartPause = 100 * time.Millisecond
+	const watcherRestarts = 4
+	const expectedWatcherRuntime = (watcherRestartInterval + watcherRestartPause) * watcherRestarts
+
+	// The watcher goroutine is watching for updates and occasionally restarts the watcher
+	// without draining the results channel.
+	watcher := func(maxRestarts int) {
+		defer close(watcherDone)
+		eventsReceived := 0
+
+		sendInitialEvents := true
+		watchOpts := &metainternalversion.ListOptions{
+			Watch:             true,
+			SendInitialEvents: &sendInitialEvents,
+		}
+		w, werr := f.watcher().Watch(f.rootCtx, watchOpts)
+		require.NoError(t, werr)
+		results := w.ResultChan()
+
+		timer := time.NewTimer(watcherRestartInterval)
+		restarts := 0
+
+		for {
+			select {
+			case <-updaterCtx.Done():
+				if w != nil {
+					w.Stop()
+				}
+				timer.Stop()
+				return
+
+			case <-timer.C:
+				timer.Stop()
+
+				// Wait a little bit to allow events to accumulate on the results channel
+				time.Sleep(watcherRestartPause)
+
+				w.Stop()
+				w = nil
+
+				// Each instance of the watcher should receive some events
+				require.Greater(t, eventsReceived, 0)
+				eventsReceived = 0
+
+				restarts++
+				if restarts >= maxRestarts {
+					return
+				}
+
+				var err error
+				w, err = f.watcher().Watch(f.rootCtx, watchOpts)
+				require.NoError(t, err)
+				results = w.ResultChan()
+				timer.Reset(watcherRestartInterval)
+
+			case _, isOpen := <-results:
+				if !isOpen {
+					results = nil
+				}
+
+				eventsReceived++ // We don't care about the event itself, just that we received it.
+			}
+		}
+	}
+
+	go watcher(watcherRestarts)
+	t.Log("Watcher started")
+
+	select {
+	case <-watcherDone:
+		// watcher finished successfully, this is the expected outcome
+	case <-time.After(expectedWatcherRuntime * 2):
+		t.Fatalf("Watcher did not finish within expected time (%v)", expectedWatcherRuntime)
+	}
 }
 
 type restOptionsGetter struct {
